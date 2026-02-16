@@ -1,0 +1,10 @@
+# pack-refs with: peeled fully-peeled sorted 
+b3536dfab86570f95e20df48ded4f51fa2b0d3dc refs/remotes/origin/dev-dynamics
+6a465917c8636a4b3c97e09efedd9d65475fdaa5 refs/remotes/origin/dev-dynamics-steering-clip
+9c9b3ae9bc4d22c7af404ef7e9b222da518fb3ef refs/remotes/origin/dev-dynamics-temporary-documentation
+281e5fc520cd4b8900492c145e2e527b93ae10b9 refs/remotes/origin/dev-humble
+d751659e4a01efc96581a6215460e7c9d78d5f30 refs/remotes/origin/docker_agent
+883394df0964c555ee05bea69c3002daf6f2d405 refs/remotes/origin/main
+fa2c2756df511bd0657f80e8dce8de1be8530632 refs/remotes/origin/multi_node
+9421b9564c5997c19b9e52e0332c00338faa1491 refs/remotes/origin/ros1
+4b3d7a994a5e2b1386dae944e221431494746763 refs/remotes/origin/ros1_archive
