@@ -1,4 +1,5 @@
 image: abn_b2_31oct_v5.pgm
+# image: /sim_ws/src/f1tenth_gym_ros/maps/abn_b2_31oct_v5.pgm
 mode: trinary
 resolution: 0.05
 origin: [-12.7, -15.2, 0]

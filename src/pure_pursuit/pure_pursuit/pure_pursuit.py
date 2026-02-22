@@ -5,7 +5,8 @@ import numpy as np
 import tf2_ros
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 
 class PurePursuitLogic:
     def __init__(self, wheelbase, waypoints):
@@ -72,21 +73,13 @@ class PurePursuitLogic:
         if final_i != -1:
             self.current_idx = final_i
         else:
-            # Re-search ALL waypoints from index 0 to num_waypoints
-            for i in range(self.num_waypoints):
-                p_world = self.waypoints[i, :2]
-                dist = np.linalg.norm(p_world - np.array([car_x, car_y]))
-                p_car = self.transform_point_to_car_frame(car_x, car_y, car_yaw, p_world)
-                
-                if dist <= lookahead_dist and dist >= longest_dist and p_car[0] > 0:
-                    longest_dist = dist
+            distances = np.linalg.norm(self.waypoints[:, :2] - np.array([car_x, car_y]), axis=1)
+            # Find indices where point is in front
+            for i in np.argsort(distances): # Check points starting from the closest
+                p_car = self.transform_point_to_car_frame(car_x, car_y, car_yaw, self.waypoints[i, :2])
+                if p_car[0] > 0: # If it's in front, snap to it
                     final_i = i
-            
-            # If still nothing found after global search, stay at start to avoid crashing
-            if final_i != -1:
-                self.current_idx = final_i
-            else:
-                final_i = start
+                    break
 
         target_pt_car = self.transform_point_to_car_frame(car_x, car_y, car_yaw, self.waypoints[final_i, :2])
         return target_pt_car, longest_dist, final_i
@@ -94,18 +87,21 @@ class PurePursuitLogic:
     def calculate_steering(self, target_point, lookahead_dist, k_p):
         y = target_point[1]
         # Calculated from https://docs.google.com/presentation/d/1jpnlQ7ysygTPCi8dmyZjooqzxNXWqMgO31ZhcOlKVOE/edit#slide=id.g63d5f5680f_0_33
-        steering_angle = k_p * (2.0 * y) / (lookahead_dist**2)
+        safe_la = max(lookahead_dist, 0.1)
+        steering_angle = k_p * (2.0 * y) / (safe_la**2)
+        if np.isnan(steering_angle) or np.isinf(steering_angle):
+            steering_angle = 0.0
         return steering_angle
 
 class ControllerManager(Node):
     def __init__(self):
         super().__init__('pure_pursuit_node')
 
-        self.declare_parameter("waypoints_path", "/sim_ws/src/pure_pursuit/racelines/traj_race_cl-oct31_v5.csv")
+        self.declare_parameter("waypoints_path", "/sim_ws/src/pure_pursuit/racelines/arc.csv")
         self.declare_parameter("odom_topic", "/ego_racecar/odom")
         self.declare_parameter("drive_topic", "/drive")
-        self.declare_parameter("min_lookahead", 0.5)
-        self.declare_parameter("max_lookahead", 1.0)
+        self.declare_parameter("min_lookahead", 1.0)
+        self.declare_parameter("max_lookahead", 2.0)
         self.declare_parameter("lookahead_ratio", 8.0)
         self.declare_parameter("K_p", 0.5)
         self.declare_parameter("steering_limit", 25.0) # Degrees
@@ -124,8 +120,8 @@ class ControllerManager(Node):
         self.wheelbase = self.get_parameter("wheelbase").value
 
         # 2. Initialize Logic & Data
-        self.planner = PurePursuitLogic(self.wheelbase, self.waypoints)
         self.waypoints = np.loadtxt(self.path, delimiter=',', skiprows=1) # Assume x, y, v
+        self.planner = PurePursuitLogic(self.wheelbase, self.waypoints)
         self.curr_velocity = 0.0
 
         # 3. Pubs & Subs
@@ -133,6 +129,11 @@ class ControllerManager(Node):
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 10)
         
         self.get_logger().info("Pure Pursuit Node Started")
+        self.viz_pub = self.create_publisher(Marker, '/waypoint_markers', 10)
+        self.path_viz_pub = self.create_publisher(Marker, '/full_track_path', 10)
+        # Trigger the path visualization once at the start
+        # (Wait a tiny bit for RViz to connect)
+        self.create_timer(1.0, self.publish_static_path)
 
     def get_yaw_from_quat(self, q):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -154,7 +155,14 @@ class ControllerManager(Node):
             car_x, car_y, car_yaw, lookahead_dist
         )
 
-        # 4. Control: Calculate steering and fetch speed from waypoints
+        # Control: Calculate steering and fetch speed from waypoints
+        if target_idx != -1:
+            self.visualize_lookahead_point(self.waypoints[target_idx])
+
+        if target_idx == -1:
+            self.get_logger().warn("Waiting for valid waypoint...")
+            self.publish_drive(0.0, 0.0) 
+            return
         steer = self.planner.calculate_steering(target_pt_car, actual_la, self.kp)
         # Target velocity is scaled by a safety percentage
         target_vel = self.waypoints[target_idx, 2] * self.vel_percent
@@ -167,6 +175,75 @@ class ControllerManager(Node):
         drive_msg.drive.speed = float(vel)
         drive_msg.drive.steering_angle = float(steer)
         self.drive_pub.publish(drive_msg)
+    
+    def visualize_lookahead_point(self, point):
+        """
+        Publishes a marker to visualize the current lookahead point in RViz.
+        :param point: A list or array [x, y] in the 'map' frame.
+        """
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "lookahead_point"
+        marker.id = 1
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        
+        # Set the scale of the sphere (diameter in meters)
+        marker.scale.x = 0.25
+        marker.scale.y = 0.25
+        marker.scale.z = 0.25
+        
+        # Set the color (RGBA) - Bright Red for visibility
+        marker.color.a = 1.0
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        
+        # Set the position of the marker
+        marker.pose.position.x = float(point[0])
+        marker.pose.position.y = float(point[1])
+        marker.pose.position.z = 0.0 # Waypoints are on the 2D plane
+        
+        # Publish the marker
+        self.viz_pub.publish(marker)
+    def publish_static_path(self):
+        """
+        Publishes all waypoints from the CSV as a single continuous green line.
+        """
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "static_path"
+        marker.id = 0
+        marker.type = Marker.LINE_STRIP # This connects all points in order
+        marker.action = Marker.ADD
+        
+        # Line width
+        marker.scale.x = 0.1 
+        
+        # Color: Green (so it contrasts with your red lookahead dot)
+        marker.color.a = 1.0
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        
+        # Add all waypoints from your loaded CSV to the marker
+        for wp in self.waypoints:
+            p = Point()
+            p.x = float(wp[0])
+            p.y = float(wp[1])
+            p.z = 0.0
+            marker.points.append(p)
+        
+        # If it's a loop, connect the last point to the first
+        if len(self.waypoints) > 0:
+            p_start = Point()
+            p_start.x = float(self.waypoints[0][0])
+            p_start.y = float(self.waypoints[0][1])
+            marker.points.append(p_start)
+
+        self.path_viz_pub.publish(marker)
 
 def main(args=None):
     rclpy.init(args=args)
