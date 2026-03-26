@@ -4,10 +4,13 @@ from rclpy.node import Node
 import numpy as np
 import tf2_ros
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
 from ackermann_msgs.msg import AckermannDriveStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from pure_pursuit.pure_pursuit_logic import PurePursuitLogic
+from pure_pursuit.ftg_logic import FTGLogic
 
 class ControllerManager(Node):
     def __init__(self):
@@ -16,8 +19,8 @@ class ControllerManager(Node):
         self.declare_parameter("waypoints_path", "/sim_ws/src/pure_pursuit/racelines/arc.csv")
         self.declare_parameter("odom_topic", "/ego_racecar/odom")
         self.declare_parameter("drive_topic", "/drive")
-        self.declare_parameter("min_lookahead", 1.0)
-        self.declare_parameter("max_lookahead", 2.0)
+        self.declare_parameter("min_lookahead", 2.0)
+        self.declare_parameter("max_lookahead", 3.0)
         self.declare_parameter("lookahead_ratio", 8.0)
         self.declare_parameter("K_p", 0.5)
         self.declare_parameter("steering_limit", 25.0) # Degrees
@@ -37,13 +40,18 @@ class ControllerManager(Node):
 
         # 2. Initialize Logic & Data
         self.waypoints = np.loadtxt(self.path, delimiter=',', skiprows=1) # Assume x, y, v
-        self.planner = PurePursuitLogic(self.wheelbase, self.waypoints)
+        self.pure_pursuit_logic = PurePursuitLogic(self.wheelbase, self.waypoints)
+        self.ftg_logic = FTGLogic()
         self.curr_velocity = 0.0
+        self.current_state = "GB_TRACK" 
+        self.latest_scan = None
 
         # 3. Pubs & Subs
         self.drive_pub = self.create_publisher(AckermannDriveStamped, self.drive_topic, 10)
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 10)
-        
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.state_sub = self.create_subscription(String, '/state', self.state_callback, 10)
+
         self.get_logger().info("Pure Pursuit Node Started")
         self.viz_pub = self.create_publisher(Marker, '/waypoint_markers', 10)
         self.path_viz_pub = self.create_publisher(Marker, '/full_track_path', 10)
@@ -51,41 +59,58 @@ class ControllerManager(Node):
         # (Wait a tiny bit for RViz to connect)
         self.create_timer(1.0, self.publish_static_path)
 
+    def state_callback(self, msg):
+        self.current_state = msg.data
+    
+    def scan_callback(self, msg):
+        self.latest_scan = msg
+
     def get_yaw_from_quat(self, q):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         return np.arctan2(siny_cosp, cosy_cosp)
 
     def odom_callback(self, msg):
-        # Perception: Get car position
+        self.curr_velocity = msg.twist.twist.linear.x
+        
+        if self.current_state == "FTGONLY":
+            self.execute_ftg_logic()
+        else:
+            self.execute_pure_pursuit_logic(msg)
+    
+    def execute_ftg_logic(self):
+        if self.latest_scan is None:
+            return
+            
+        speed, steer = self.ftg_logic.process_lidar(self.latest_scan)
+        self.get_logger().warn(f"FTG Active: Steer={steer:.2f}, Speed={speed:.2f}", throttle_duration_sec=1.0)
+        self.publish_drive(steer, speed)
+
+    def execute_pure_pursuit_logic(self, msg):
         car_x = msg.pose.pose.position.x
         car_y = msg.pose.pose.position.y
         car_yaw = self.get_yaw_from_quat(msg.pose.pose.orientation)
-        self.curr_velocity = msg.twist.twist.linear.x
 
-        # Dynamic Lookahead calculation (change lookahead based on the current velocity)
-        lookahead_dist = np.clip(self.max_la * self.curr_velocity / self.la_ratio, self.min_la, self.max_la)
+        # Dynamic Lookahead
+        la_ratio = self.get_parameter("lookahead_ratio").value
+        min_la = self.get_parameter("min_lookahead").value
+        max_la = self.get_parameter("max_lookahead").value
+        lookahead_dist = np.clip(max_la * self.curr_velocity / la_ratio, min_la, max_la)
 
-        # Planning: Use the Logic class to find the target
-        target_pt_car, actual_la, target_idx = self.planner.find_target_waypoint(
+        target_pt_car, actual_la, target_idx = self.pure_pursuit_logic.find_target_waypoint(
             car_x, car_y, car_yaw, lookahead_dist
         )
 
-        # Control: Calculate steering and fetch speed from waypoints
-        if target_idx != -1:
-            self.visualize_lookahead_point(self.waypoints[target_idx])
-
         if target_idx == -1:
-            self.get_logger().warn("Waiting for valid waypoint...")
             self.publish_drive(0.0, 0.0) 
             return
-        steer = self.planner.calculate_steering(target_pt_car, actual_la, self.kp)
-        # Target velocity is scaled by a safety percentage
+
+        self.visualize_lookahead_point(self.waypoints[target_idx])
+        steer = self.pure_pursuit_logic.calculate_steering(target_pt_car, actual_la, self.kp)
         target_vel = self.waypoints[target_idx, 2] * self.vel_percent
         
-        # 5. Actuation: Send commands to the car
         self.publish_drive(steer, target_vel)
-
+   
     def publish_drive(self, steer, vel):
         drive_msg = AckermannDriveStamped()
         drive_msg.drive.speed = float(vel)
